@@ -1,6 +1,6 @@
 import asyncio
 from aiohttp import web
-from scheduler import Scheduler
+from petals.router.scheduler import Scheduler
 import torch
 import time
 from transformers import AutoTokenizer
@@ -15,8 +15,12 @@ from petals import AutoDistributedModelForCausalLM
     
 class Http_server:
 
-    def __init__(self, model_name):
-        self.initial_peers = ['/ip4/192.168.130.235/tcp/45819/p2p/12D3KooWM6kxcrVsFZLRW5dbPBcarvL7PpXs2zV3eESs5Xkxez7G']
+    def __init__(
+            self,
+            initial_peers,
+            model_name,
+    ):
+        self.initial_peers = initial_peers
         self.scheduler = None
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, add_bos_token=False)
@@ -74,7 +78,8 @@ class Http_server:
             loop.run_until_complete(self.main())
 
 if __name__ == '__main__':
-    server = Http_server('petals-team/StableBeluga2')
+    initial_peers = ['/ip4/192.168.130.235/tcp/45819/p2p/12D3KooWM6kxcrVsFZLRW5dbPBcarvL7PpXs2zV3eESs5Xkxez7G']
+    server = Http_server(initial_peers, 'petals-team/StableBeluga2')
     server.server_start()
 
     

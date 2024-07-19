@@ -3,8 +3,9 @@ from aiohttp import web
 
 async def handle(request):
     if request.method == 'POST':
+        print("response")
         data = await request.post()
-        message = data.get('message', 'No message received')
+        message = data.get('text', 'No message received')
         print(f"Received message: {message}")
         return web.Response(text=f"Message received: {message}")
     else:
