@@ -90,6 +90,8 @@ class TransformerConnectionHandler(ConnectionHandler):
         self.session_timeout, self.step_timeout = session_timeout, step_timeout
         self._prioritizer = task_prioritizer
         self.quant_type = quant_type
+        self.cached_requests_table = mp.Manager().dict()
+        self._lock_metadata = mp.Lock()
 
     async def add_p2p_handlers(self, *args, **kwargs) -> None:
         if self._listener_task is None:
@@ -147,6 +149,10 @@ class TransformerConnectionHandler(ConnectionHandler):
             try:
                 metadata = MSGPackSerializer.loads(request.metadata) if request.metadata else {}
                 requested_backends = tuple(self.module_backends[uid] for uid in requested_uids)
+
+                # we get request_id from metadata here
+                iteration_info = metadata.get("iteration_info")
+
                 max_length = metadata.get("max_length")
                 points = metadata.get("points", 0)
                 session_id = metadata.get("session_id")
@@ -168,7 +174,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                 batch_size = request.tensors[0].size[0] if request.tensors else 1
 
                 async with self._allocate_cache(
-                    requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
+                    iteration_info, requested_backends, batch_size=batch_size, max_length=max_length, timeout=alloc_timeout
                 ) as cache_handles:
                     background_tasks = set()
                     async for output_tensors, can_push, step_metadata in iterate_rpc_inference(
@@ -532,6 +538,7 @@ class TransformerConnectionHandler(ConnectionHandler):
     @contextlib.asynccontextmanager
     async def _allocate_cache(
         self,
+        iteration_info,
         backends: Sequence[TransformerBackend],
         *,
         batch_size: int,
@@ -542,9 +549,14 @@ class TransformerConnectionHandler(ConnectionHandler):
         Allocate memory cache for all transformer blocks, return cache handle
         :returns: a list of {len(backends)} elements, where i-th element is a tuple of cache handles for i-th backend
         """
-        descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
-        async with backends[0].memory_cache.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
-            yield nested_pack(handles, descriptors)
+        # this should only generate descr for new requests
+        descriptors = [backend.get_inference_cache_descriptors_req(backends[0].memory_cache.cached_requests_table, iteration_info, batch_size, max_length) for backend in backends]
+
+        finished_request_id_table = iteration_info['finished_request_id_table']
+
+        async with backends[0].memory_cache.allocate_cache_new(*chain(*descriptors), timeout=timeout) as handles:
+            yield tuple((descriptors, list(handles)))
+        
 
     def _log_request(
         self,

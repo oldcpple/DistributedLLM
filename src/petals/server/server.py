@@ -229,6 +229,8 @@ class Server:
 
         gib = 1024**3
         self.attn_cache_bytes = self._cache_bytes_per_block * num_blocks
+        # for test
+        self.attn_cache_bytes = 5368709120
         logger.info(f"Attention cache for all blocks will consume up to {self.attn_cache_bytes / gib:.2f} GiB")
 
         assert isinstance(throughput, float) or throughput in ["auto", "eval", "dry_run"]
@@ -484,6 +486,7 @@ class ModuleContainer(threading.Thread):
 
         blocks = {}
         try:
+
             for module_uid, block_index in zip(module_uids, block_indices):
                 block = load_pretrained_block(
                     converted_model_name_or_path,

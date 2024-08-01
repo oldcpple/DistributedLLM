@@ -154,7 +154,9 @@ async def iterate_rpc_inference(
     quant_type: QuantType,
     args_structure: Any = None,
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
-    assert len(cache_handles) == len(requested_backends)
+    descriptors = cache_handles[0]
+    cache_handles = cache_handles[1]
+    #assert len(cache_handles) == len(requested_backends)
 
     prefix_length = 0
     point_per_piece = points / max_length if max_length > 0 else 0.0
@@ -166,6 +168,10 @@ async def iterate_rpc_inference(
                 prefix_length >= start_from_position,
             ), f"prefix_length={prefix_length}, start_from_position={start_from_position}"
             prefix_length = start_from_position
+
+        # we got request_id here
+        iteration_info = step_metadata.get('iteration_info')
+        print('block_functions.py, request_id: {}'.format(iteration_info['request_id_table']))
 
         flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
         if args_structure is not None:
@@ -212,17 +218,17 @@ async def iterate_rpc_inference(
             assert hidden_states.ndim == 3, f"hidden states must be a single 3d tensor"
             if can_merge_pools:
                 inference_infos = tuple(
-                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
-                    for uid, handles in zip(requested_uids, cache_handles)
+                    InferenceMetadata(uid, prefix_length, tuple(handles), descriptor, active_adapter)
+                    for uid, handles ,descriptor in zip(requested_uids, cache_handles, descriptors)
                 )
                 (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
-                    hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
+                    hidden_states, hypo_ids, inference_infos, iteration_info, *prompts, priority=priority
                 )
             else:
-                for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
-                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
+                for backend, uid, handles, descriptor, prompt in zip(requested_backends, requested_uids, cache_handles, descriptors, prompts):
+                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), descriptor, active_adapter),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
-                        hidden_states, hypo_ids, inference_infos, prompt, priority=priority
+                        hidden_states, hypo_ids, inference_infos, iteration_info, prompt, priority=priority
                     )
 
         # serialize and send last layer outputs

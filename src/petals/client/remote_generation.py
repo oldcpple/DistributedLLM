@@ -13,10 +13,50 @@ from transformers.generation.utils import ModelOutput
 from petals.client.inference_session import InferenceSession
 from petals.client.remote_sequential import RemoteSequential
 from petals.utils.misc import DUMMY, docstring_from
+from petals.utils.generation_utils import GenerationMixin
 
 logger = get_logger(__name__)
 
 
+class NewRemotePastKeyValues(Cache):
+    """only keeps the number of seen tokens. pretends to be a legit cache"""
+
+    def __init__(self, iteration_info) -> None:
+        super().__init__()
+        batch_size = iteration_info['batch_size']
+        request_id_table = iteration_info['request_id_table']
+        self._seen_tokens = {}
+        for request_id in request_id_table:
+            self._seen_tokens[request_id] = 0
+        self.hypo_ids: Optional[torch.LongTensor] = None
+
+    def __getitem__(self, _index: int) -> List[torch.Tensor]:
+        return [DUMMY]  # For compatibility with BloomForCausalLM.prepare_inputs_for_generation()
+    
+    def add_request(self, iteration_info):
+        request_id_table = iteration_info['request_id_table']
+        for request_id in request_id_table:
+            self._seen_tokens[request_id] = 0
+
+    def get_seq_length(self, iteration_info, layer_idx: Optional[int] = 0,) -> int:
+        request_id_table = iteration_info['request_id_table']
+        return [self._seen_tokens[request_id] for request_id in request_id_table]
+
+    def get_max_length(self) -> Optional[int]:
+        return None
+
+    def update_seen(self, new_seen: int, iteration_info) -> None:
+        request_id_table = iteration_info['request_id_table']
+        iter_token_num_table = iteration_info['iter_token_num_table']
+        idx = 0
+        for request_id in request_id_table:
+            self._seen_tokens[request_id] += iter_token_num_table[idx]
+            idx += 1
+        #self._seen_tokens += new_seen
+
+    def reorder_cache(self, beam_idx):
+        raise NotImplementedError("Beam search reordering is not implemented yet")
+    
 class RemotePastKeyValues(Cache):
     """only keeps the number of seen tokens. pretends to be a legit cache"""
 
@@ -39,6 +79,7 @@ class RemotePastKeyValues(Cache):
 
     def reorder_cache(self, beam_idx):
         raise NotImplementedError("Beam search reordering is not implemented yet")
+    
 
 
 _skipped_tokens = ContextVar("skipped_tokens", default=0)
@@ -133,20 +174,24 @@ class RemoteGenerationMixin(_SkipTokensMixin):
                 past_key_values = RemotePastKeyValues()
                 past_key_values.update_seen(session.position)
                 kwargs["past_key_values"] = past_key_values
+            
 
-            result = super().generate(inputs, *args, **kwargs)
+            results = GenerationMixin().generate(inputs, *args, **kwargs)
+            
+            result = results[0]
+            info = results[1]
 
             sequences = result.sequences if isinstance(result, ModelOutput) else result
             # Save tokens from this .generate() call
             session.output_ids = sequences
             # Crop the last tokens from the previous call
-            sequences = sequences[:, n_prev_tokens:].clone()
+            #sequences = sequences[:, n_prev_tokens:].clone()
             if isinstance(result, ModelOutput):
                 result.sequences = sequences
             else:
                 result = sequences
 
-        return result
+        return (result, info)
 
     @staticmethod
     def _fix_generate_kwargs(kwargs: dict):

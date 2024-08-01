@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 from hivemind.utils.logging import get_logger
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-from transformers.models.bloom import BloomForCausalLM, BloomForSequenceClassification, BloomModel, BloomPreTrainedModel
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, CausalLMOutputWithCrossAttentions
+from petals.models.bloom.modeling_bloom import BloomForCausalLM, BloomForSequenceClassification, BloomModel, BloomPreTrainedModel
 
 from petals.client.from_pretrained import FromPretrainedMixin
 from petals.client.lm_head import LMHead
@@ -14,6 +14,10 @@ from petals.client.ptune import PTuneMixin
 from petals.client.remote_generation import RemoteGenerationMixin, RemotePastKeyValues
 from petals.client.remote_sequential import RemoteSequential
 from petals.models.bloom.config import DistributedBloomConfig
+import numpy as np
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
+from typing import Optional, Tuple, Union
+import time
 
 logger = get_logger(__name__)
 
@@ -40,6 +44,7 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        iteration_info = None,
         past_key_values: Optional[RemotePastKeyValues] = None,
         attention_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.LongTensor] = None,
@@ -49,6 +54,7 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ):
+
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
@@ -87,7 +93,10 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
             hidden_states,
             prompts=intermediate_prompts,
             hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
+            iteration_info=iteration_info,
         )
+
+        timestamp = time.time()
 
         # Remove prefix
         if use_prompts:
@@ -100,12 +109,13 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)
         hidden_states = hidden_states.view(output_shape)
-        return BaseModelOutputWithPastAndCrossAttentions(
+        b = BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=None,
             attentions=None,
         )
+        return (b, timestamp)
 
 
 class DistributedBloomForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, BloomForCausalLM):
@@ -125,6 +135,57 @@ class DistributedBloomForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Bl
         self.post_init()
 
     def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ) -> dict:
+        # we should seperately handle input_ids, attention_mask
+        # and position_ids for each request in the batch
+        iteration_info = kwargs.get("iteration_info")
+        # following are lists
+        batch_size = iteration_info['batch_size']
+        past_length = iteration_info['input_length_table']
+        length_this_iter = iteration_info['iter_token_num_table']
+
+        # handle input_ids
+        new_input_ids = []
+        length_idx = 0
+        for i in range(batch_size):
+            req_input_ids = input_ids[:, length_idx + past_length[i] - length_this_iter[i]:length_idx + past_length[i]]
+            new_input_ids.append(req_input_ids)
+            length_idx += past_length[i]
+        input_ids = torch.concat(new_input_ids, dim=1)
+        assert input_ids.shape[1] == np.sum(length_this_iter)
+
+        # handle attention_mask and position_ids
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            new_position_ids = []
+            length_idx = 0
+            for i in range(batch_size):
+                req_attention_mask = attention_mask[:, length_idx:length_idx + past_length[i]]
+                req_position_ids = req_attention_mask.long().cumsum(-1) - 1
+                req_position_ids.masked_fill_(req_attention_mask == 0, 1)
+                req_position_ids = req_position_ids[:, -length_this_iter[i]]
+                new_position_ids.append(req_position_ids)
+            position_ids = torch.concat(new_input_ids, dim=1)
+        
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+                "iteration_info": kwargs.get("iteration_info")
+            }
+        )
+        return model_inputs
+    
+    def prepare_inputs_for_generation_bk(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ) -> dict:
         # Omit tokens covered by past_key_values
@@ -169,6 +230,7 @@ class DistributedBloomForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Bl
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+                "iteration_info": kwargs.get("iteration_info")
             }
         )
         return model_inputs

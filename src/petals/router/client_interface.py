@@ -14,6 +14,7 @@ class Http_client:
         async with aiohttp.ClientSession() as session:
             response_text = await self.send_message(session, url, message)
             print(response_text)
+            return response_text
     
     def client_run(self, url, prompt):
         asyncio.run(self.main(url, prompt))
@@ -26,5 +27,7 @@ def generate_text(prompt: str):
 
 
 if __name__ == '__main__':
-    prompt = {'text': 'how old are you?'}
+    prompt = {'text': 'What is computer science?'}
+    generate_text(prompt)
+    prompt = {'text': 'What is AI?'}
     generate_text(prompt)

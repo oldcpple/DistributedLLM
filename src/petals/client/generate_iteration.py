@@ -34,60 +34,60 @@ from transformers.generation.stopping_criteria import (
     StoppingCriteriaList,
     validate_stopping_criteria,
 )
-# from transformers.pytorch_utils import torch_int_div
+#from transformers.pytorch_utils import torch_int_div
 from transformers.utils import ModelOutput, logging
-from transformers.generation.utils import GenerationMixin, GreedySearchOutput, SampleOutput, BeamSampleOutput, \
-    BeamSearchOutput, \
-    GreedySearchEncoderDecoderOutput, GreedySearchDecoderOnlyOutput
+from transformers.generation.utils import GenerationMixin, GreedySearchOutput, SampleOutput, BeamSampleOutput, BeamSearchOutput, \
+                                          GreedySearchEncoderDecoderOutput, GreedySearchDecoderOnlyOutput
+
 
 logger = logging.get_logger(__name__)
 
 
 class IterationLevelGenerationMixin(GenerationMixin):
-
+    
     @torch.no_grad()
     def generate(
-            self,
-            inputs: Optional[torch.Tensor] = None,
-            max_length: Optional[int] = None,
-            min_length: Optional[int] = None,
-            do_sample: Optional[bool] = None,
-            early_stopping: Optional[bool] = None,
-            num_beams: Optional[int] = None,
-            temperature: Optional[float] = None,
-            top_k: Optional[int] = None,
-            top_p: Optional[float] = None,
-            typical_p: Optional[float] = None,
-            repetition_penalty: Optional[float] = None,
-            bad_words_ids: Optional[Iterable[int]] = None,
-            force_words_ids: Optional[Union[Iterable[int], Iterable[Iterable[int]]]] = None,
-            bos_token_id: Optional[int] = None,
-            pad_token_id: Optional[int] = None,
-            eos_token_id: Optional[int] = None,
-            length_penalty: Optional[float] = None,
-            no_repeat_ngram_size: Optional[int] = None,
-            encoder_no_repeat_ngram_size: Optional[int] = None,
-            num_return_sequences: Optional[int] = None,
-            max_time: Optional[float] = None,
-            max_new_tokens: Optional[int] = None,
-            decoder_start_token_id: Optional[int] = None,
-            use_cache: Optional[bool] = None,
-            num_beam_groups: Optional[int] = None,
-            diversity_penalty: Optional[float] = None,
-            prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
-            logits_processor: Optional[LogitsProcessorList] = LogitsProcessorList(),
-            stopping_criteria: Optional[StoppingCriteriaList] = StoppingCriteriaList(),
-            constraints: Optional[List[Constraint]] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_scores: Optional[bool] = None,
-            return_dict_in_generate: Optional[bool] = None,
-            forced_bos_token_id: Optional[int] = None,
-            forced_eos_token_id: Optional[int] = None,
-            remove_invalid_values: Optional[bool] = None,
-            synced_gpus: Optional[bool] = False,
-            exponential_decay_length_penalty: Optional[Tuple[Union[int, float]]] = None,
-            **model_kwargs,
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        max_length: Optional[int] = None,
+        min_length: Optional[int] = None,
+        do_sample: Optional[bool] = None,
+        early_stopping: Optional[bool] = None,
+        num_beams: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        typical_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        bad_words_ids: Optional[Iterable[int]] = None,
+        force_words_ids: Optional[Union[Iterable[int], Iterable[Iterable[int]]]] = None,
+        bos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        length_penalty: Optional[float] = None,
+        no_repeat_ngram_size: Optional[int] = None,
+        encoder_no_repeat_ngram_size: Optional[int] = None,
+        num_return_sequences: Optional[int] = None,
+        max_time: Optional[float] = None,
+        max_new_tokens: Optional[int] = None,
+        decoder_start_token_id: Optional[int] = None,
+        use_cache: Optional[bool] = None,
+        num_beam_groups: Optional[int] = None,
+        diversity_penalty: Optional[float] = None,
+        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+        logits_processor: Optional[LogitsProcessorList] = LogitsProcessorList(),
+        stopping_criteria: Optional[StoppingCriteriaList] = StoppingCriteriaList(),
+        constraints: Optional[List[Constraint]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_scores: Optional[bool] = None,
+        return_dict_in_generate: Optional[bool] = None,
+        forced_bos_token_id: Optional[int] = None,
+        forced_eos_token_id: Optional[int] = None,
+        remove_invalid_values: Optional[bool] = None,
+        synced_gpus: Optional[bool] = False,
+        exponential_decay_length_penalty: Optional[Tuple[Union[int, float]]] = None,
+        **model_kwargs,
     ) -> Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, torch.LongTensor]:
 
         # 1. Set generation parameters if not already defined
@@ -188,16 +188,16 @@ class IterationLevelGenerationMixin(GenerationMixin):
         # 6. determine generation mode
         is_constraint_gen_mode = constraints is not None or force_words_ids is not None
         is_greedy_gen_mode = (
-                (num_beams == 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
+            (num_beams == 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
         )
         is_sample_gen_mode = (
-                (num_beams == 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
+            (num_beams == 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
         )
         is_beam_gen_mode = (
-                (num_beams > 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
+            (num_beams > 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
         )
         is_beam_sample_gen_mode = (
-                (num_beams > 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
+            (num_beams > 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
         )
         is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1) and not is_constraint_gen_mode
 
@@ -438,8 +438,8 @@ class IterationLevelGenerationMixin(GenerationMixin):
                         if any(not isinstance(token_ids, list) for token_ids in word_ids):
                             typeerror()
                         if any(
-                                any((not isinstance(token_id, int) or token_id < 0) for token_id in token_ids)
-                                for token_ids in word_ids
+                            any((not isinstance(token_id, int) or token_id < 0) for token_id in token_ids)
+                            for token_ids in word_ids
                         ):
                             typeerror()
 
@@ -481,20 +481,21 @@ class IterationLevelGenerationMixin(GenerationMixin):
                 **model_kwargs,
             )
 
+
     def iteration_level_greedy_search(
-            self,
-            input_ids: torch.LongTensor,
-            logits_processor: Optional[LogitsProcessorList] = None,
-            stopping_criteria: Optional[StoppingCriteriaList] = None,
-            max_length: Optional[int] = None,
-            pad_token_id: Optional[int] = None,
-            eos_token_id: Optional[int] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_scores: Optional[bool] = None,
-            return_dict_in_generate: Optional[bool] = None,
-            synced_gpus: Optional[bool] = False,
-            **model_kwargs,
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        max_length: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_scores: Optional[bool] = None,
+        return_dict_in_generate: Optional[bool] = None,
+        synced_gpus: Optional[bool] = False,
+        **model_kwargs,
     ) -> Union[GreedySearchOutput, torch.LongTensor]:
 
         # init values
