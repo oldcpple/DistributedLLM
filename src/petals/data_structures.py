@@ -114,4 +114,5 @@ class InferenceMetadata:
     uid: ExpertUID
     prefix_length: int
     cache_handles: Tuple[Handle, ...]
+    descriptor: None
     active_adapter: Optional[str]

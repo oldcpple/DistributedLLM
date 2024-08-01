@@ -5,10 +5,13 @@ import torch
 import time
 from transformers import AutoTokenizer
 from petals import AutoDistributedModelForCausalLM
+import os
+
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 
-    # a collector is a http server that collects requests(prompts) 
-    # from clients and encode them and then sends to the scheduler
+    # It is a http server that collects requests(prompts) 
+    # from clients and then sends to the scheduler
     # it's also responsible for sending the final results back to clients
 
     # it will start a http server at localhost:8080
@@ -16,7 +19,7 @@ from petals import AutoDistributedModelForCausalLM
 class Http_server:
 
     def __init__(self, model_name):
-        self.initial_peers = ['/ip4/192.168.130.235/tcp/45819/p2p/12D3KooWM6kxcrVsFZLRW5dbPBcarvL7PpXs2zV3eESs5Xkxez7G']
+        self.initial_peers = ['/ip4/127.0.0.1/tcp/36179/p2p/12D3KooWHeM4WehK6fgMsDwywCderkQKAZXkTraiaqRb2bbYwAnu']
         self.scheduler = None
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, add_bos_token=False)
@@ -35,7 +38,7 @@ class Http_server:
         scheduler.add_request(inputs, timestamp)
 
     async def handle(self, request):
-        data = await request.post()
+        data = await request.json()
         text = data.get('text')
         queue_id = id(request)
 
@@ -43,12 +46,12 @@ class Http_server:
 
         self.scheduler.response_queues[queue_id] = asyncio.Queue()
         # route to scheduler
-        await self.scheduler.data_queue.put((wrapped_data, queue_id))
+        #await self.scheduler.data_queue.put((wrapped_data, queue_id))
+        await self.scheduler.collect_prompts_new(wrapped_data, queue_id)
 
         result = await self.scheduler.response_queues[queue_id].get()
-        print(result)
-        del self.scheduler.response_queues[queue_id]
-        return web.json_response({'result': result})
+        result_text, result_length = result
+        return web.json_response({'result': result_text, 'length': result_length})
 
     async def init_app(self):
         app = web.Application()
@@ -60,21 +63,20 @@ class Http_server:
         app = await self.init_app()
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, 'localhost', 8080)
+        site = web.TCPSite(runner, '0.0.0.0', 8080)
         await site.start()
-        print("Server started at http://localhost:8080")
+        print("Server started at http://0.0.0.0:8080")
         await asyncio.Event().wait()
     
     def server_start(self):
-        with self.model.inference_session(max_length=20) as sess:
-            self.scheduler = Scheduler(self.model, self.tokenizer, sess)
-            loop = asyncio.get_event_loop()
-            loop.create_task(self.scheduler.collect_prompts())
-            loop.create_task(self.scheduler.scheduler_main())
-            loop.run_until_complete(self.main())
+        self.scheduler = Scheduler(self.model, self.tokenizer, None)
+        loop = asyncio.get_event_loop()
+        #loop.create_task(self.scheduler.collect_prompts())
+        loop.create_task(self.scheduler.scheduler_main())
+        loop.run_until_complete(self.main())
 
 if __name__ == '__main__':
-    server = Http_server('petals-team/StableBeluga2')
+    server = Http_server('bigscience/bloom-7b1')
     server.server_start()
 
     

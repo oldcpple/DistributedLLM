@@ -19,10 +19,15 @@ from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
 from petals.data_structures import Handle
 from petals.utils.asyncio import shield_and_wait
 from petals.utils.misc import get_size_in_bytes
-
+from petals.server.req_tensor_descr import NewTensorDescriptor
 logger = get_logger(__name__)
 
-
+'''
+class Handle:
+    def __init__(self, request_id, idx):
+        self.request_id = request_id
+        self.idx = idx
+'''
 class MemoryCache:
     """A shared cache for storing tensors that persist across calls. Main use case: storing past attention KVs"""
 
@@ -33,12 +38,19 @@ class MemoryCache:
         self._current_size = mp.Value(ctypes.c_int64, 0, lock=False)
         self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
-        self._allocated_tensors: Dict[Handle, torch.Tensor] = {}
+        self._allocated_tensors_key: Dict[Handle, torch.Tensor] = {}
+        self._allocated_tensors_value: Dict[Handle, torch.Tensor] = {}
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
         self._lock_acquire_memory = mp.Lock()
         self._memory_freed_event = mp.Event()
+        self.handles_to_alloc = mp.Manager().list()
+        self.descr_to_alloc = mp.Manager().list()
+        self.cached_requests_table = mp.Manager().dict()
+        self.request_cache_to_del = mp.Manager().list()
+
+        #self.attention_alloc_table = {}
 
     @property
     def current_size_bytes(self) -> int:
@@ -70,7 +82,7 @@ class MemoryCache:
 
     @contextlib.asynccontextmanager
     async def allocate_cache(
-        self, *descriptors: TensorDescriptor, timeout: float
+        self, *descriptors: NewTensorDescriptor, timeout: float
     ) -> AsyncContextManager[Sequence[Handle]]:
         """
         Create a handle that is associated with buffers on unique device. If cache full, raises AllocationFailed.
@@ -106,9 +118,58 @@ class MemoryCache:
         finally:
             self._free(max_alloc_size, alloc_task)
 
+    @contextlib.asynccontextmanager
+    async def allocate_cache_new(
+        self, *descriptors: NewTensorDescriptor, timeout: float
+    ) -> AsyncContextManager[Sequence[Handle]]:
+        """
+        a modified version of allocate_cache()
+        in the original allocate_cache(), descriptors is a tuple of two TensorDescriptors
+        in this method however, descriptors is a tuple of two list of TensorDescriptors
+        """
+        assert os.getpid() != self.runtime_pid, "must be called by a ConnectionHandler, not runtime"
+        key_descriptors = descriptors[0]
+        value_descriptors = descriptors[1]
+
+        assert all(descr.device is not None for descr in key_descriptors), "please specify allocated devices"
+        assert all(descr.device is not None for descr in value_descriptors), "please specify allocated devices"
+        if self.max_alloc_timeout is not None:
+            timeout = min(timeout, self.max_alloc_timeout)
+        max_alloc_size = self.get_allocation_size(*key_descriptors) + self.get_allocation_size(*value_descriptors)
+
+        # for testing
+        max_alloc_size = 1
+
+        gib = 1024**3
+        cur_size, max_size = self.current_size_bytes, self.max_size_bytes
+        friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
+        logger.info(
+            f"rpc_inference.wait_for_alloc(size={max_alloc_size / gib:.2f} GiB), "
+            f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({cur_size / max_size * 100:.1f}%)"
+        )
+
+        alloc_task = asyncio.create_task(self._schedule_alloc_new(max_alloc_size, *descriptors, timeout=timeout))
+        try:
+            handles = await shield_and_wait(alloc_task)
+            logger.info(f"rpc_inference.alloc_done(size={max_alloc_size / gib:.2f} GiB)")
+            yield handles
+        finally:
+            self._free(max_alloc_size, alloc_task)
+
     @staticmethod
-    def get_allocation_size(*descriptors: TensorDescriptor) -> int:
+    def get_allocation_size(*descriptors: NewTensorDescriptor) -> int:
         """Return the memory size (bytes) to be allocated on a device. If there are many devices, return maximum"""
+        if len(descriptors) == 0:
+            return 0
+        alloc_size_by_device = {}
+        for descr in descriptors:
+            tensor_size = descr.numel() * get_size_in_bytes(descr.dtype)
+            alloc_size_by_device[descr.device] = alloc_size_by_device.get(descr.device, 0) + tensor_size
+        return max(alloc_size_by_device.values())
+    
+    @staticmethod
+    def get_allocation_size_new(*descriptors: NewTensorDescriptor) -> int:
+        """a modified version of get_allocation_size()"""
         alloc_size_by_device = {}
         for descr in descriptors:
             tensor_size = descr.numel() * get_size_in_bytes(descr.dtype)
@@ -116,7 +177,7 @@ class MemoryCache:
         return max(alloc_size_by_device.values())
 
     async def _schedule_alloc(
-        self, alloc_size: int, *descriptors: TensorDescriptor, timeout: Optional[float]
+        self, alloc_size: int, *descriptors: NewTensorDescriptor, timeout: Optional[float]
     ) -> Sequence[Handle]:
         """
         This method should be called inside asyncio.shield() because:
@@ -132,6 +193,66 @@ class MemoryCache:
                     return handles
         except TimeoutError:
             raise AllocationFailed(f"Could not allocate {alloc_size} (timeout={timeout})")
+        
+    async def _schedule_alloc_new(
+        self, alloc_size: int, *descriptors: NewTensorDescriptor, timeout: Optional[float]
+    ) -> Sequence[Handle]:
+        """
+        This method should be called inside asyncio.shield() because:
+            - hivemind.utils.enter_asynchronously() does not always release the lock on cancellation
+        """
+
+        handles = []
+        recovered_descr = []
+        idx = 0
+        with self._lock_metadata:
+            self.current_size_bytes += alloc_size
+        while idx < len(descriptors):
+
+            key_descriptors = descriptors[idx]
+            value_descriptors = descriptors[idx + 1]
+
+            recovered_descr.append(tuple([key_descriptors, value_descriptors]))
+            with self._lock_metadata:
+                self.descr_to_alloc.append(tuple([key_descriptors, value_descriptors]))
+            
+            # inside this we get key and value descrs for a SINGLE block
+            try:
+                async with self._wait_for_free_memory(alloc_size, timeout):
+                    with self._lock_metadata:
+                        req_key_handles = tuple(int(self.handle_counter) + i for i in range(len(key_descriptors)))
+                        self.handle_counter += len(req_key_handles)
+                        req_value_handles = tuple(int(self.handle_counter) + i for i in range(len(value_descriptors)))
+                        self.handle_counter += len(req_value_handles)
+                        if self.handle_counter >= 999999999:
+                            self.handle_counter = 0
+                        # we update attention_alloc_table in handler.py
+                        '''
+                        handle_idx = 0
+                        for req_key_handle, req_value_handle in zip(req_key_handles, req_value_handles):
+                            info = AttentionAllocInfo(req_key_handle, req_value_handle)
+                            request_id = key_descriptors[handle_idx].request_id
+                            self.attention_alloc_table.update({request_id:info})
+                            handle_idx += 1
+                        '''
+                        req_handles = tuple([req_key_handles, req_value_handles])
+
+                        self.handles_to_alloc.append(req_handles)
+
+                        #self.handle_counter += (len(key_handles) + len(value_handles))  # note: this will eventually overflow and it is okay
+                        #self.handle_counter += 2
+                        handles.append(req_handles)
+                        for key_descriptor in key_descriptors:
+                            self.cached_requests_table.update({key_descriptor.request_id:1})
+                        
+            except TimeoutError:
+                raise AllocationFailed(f"Could not allocate {alloc_size} (timeout={timeout})")
+            idx += 2
+            if idx >= len(descriptors):
+                break
+        handles = tuple(handles)
+        #self._pipe_send.send((handles, recovered_descr))
+        return handles
 
     @contextlib.asynccontextmanager
     async def _wait_for_free_memory(self, alloc_size: int, timeout: Optional[float]):
@@ -192,6 +313,7 @@ class MemoryCache:
                 )
             self._memory_freed_event.clear()
 
+    '''
     @contextlib.contextmanager
     def use_cache(self, *handles: Handle) -> Sequence[torch.Tensor]:
         """
@@ -219,6 +341,136 @@ class MemoryCache:
                         )
                     self._allocated_tensors.pop(handle, None)
         yield tuple(self._allocated_tensors[handle] for handle in handles)
+        '''
+
+    @contextlib.contextmanager
+    def reclaim_cache_for_finished_requests(self, handles):
+        assert os.getpid() == self.runtime_pid
+        for handle in handles:
+            if handle in self._allocated_tensors_key:
+                del self._allocated_tensors_key[handle]
+            elif handle in self._allocated_tensors_value:
+                del self._allocated_tensors_value[handle]
+
+
+
+
+    @contextlib.contextmanager
+    def alloc_cache_for_new_requests(self):
+        assert os.getpid() == self.runtime_pid
+        # note: this specific function is not concurrent, so you can safely allocate/offload/defragment data here
+
+        # read creation/deletion requests from connection handlers
+        if len(self.handles_to_alloc) > 0:
+            #recv_handles, recv_datas = self.info_to_alloc
+            recv_handles = tuple(self.handles_to_alloc)
+            recv_datas = self.descr_to_alloc
+            if recv_datas is not None:  # create new tensors
+                assert len(recv_handles) == len(recv_datas)
+                for recv_handle, recv_data in zip(recv_handles, recv_datas):
+                    key_handles = recv_handle[0]
+                    value_handles = recv_handle[1]
+                    key_descr = recv_data[0]
+                    value_descr = recv_data[1]
+                    # acclocate key cache
+                    # note that self._allocated_tensors is a Dict
+                    for handle, descr in zip(key_handles, key_descr):
+                        self._allocated_tensors_key[handle] = descr.make_zeros()
+                        assert handle in self._allocated_tensors_key, f"Sanity check failed: no such handle ({handle})"
+                    # acclocate value cache
+                    for handle, descr in zip(value_handles, value_descr):
+                        self._allocated_tensors_value[handle] = descr.make_zeros()
+                        assert handle in self._allocated_tensors_value, f"Sanity check failed: no such handle ({handle})"
+            with self._lock_metadata:
+                del self.handles_to_alloc[:]
+                del self.descr_to_alloc[:]
+            '''
+            else:  # delete tensors by handle
+                for recv_handle in recv_handles:
+                    key_handles = recv_handle[0]
+                    value_handles = recv_handle[1]
+                    for handle in key_handles:
+                        if handle not in self._allocated_tensors_key:
+                            logger.warning(
+                                f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
+                            )
+                        self._allocated_tensors_key.pop(handle, None)
+                    for handle in value_handles:
+                        if handle not in self._allocated_tensors_value:
+                            logger.warning(
+                                f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
+                            )
+                        self._allocated_tensors_value.pop(handle, None)
+            '''
+
+    @contextlib.contextmanager
+    def use_cache_new(self, *handles: Handle) -> Sequence[torch.Tensor]:
+        '''
+        assert os.getpid() == self.runtime_pid
+        # note: this specific function is not concurrent, so you can safely allocate/offload/defragment data here
+
+        # read creation/deletion requests from connection handlers
+        if len(self.handles_to_alloc) > 0:
+            #recv_handles, recv_datas = self.info_to_alloc
+            recv_handles = tuple(self.handles_to_alloc)
+            recv_datas = self.descr_to_alloc
+            if recv_datas is not None:  # create new tensors
+                assert len(recv_handles) == len(recv_datas)
+                total = 0
+                for recv_handle, recv_data in zip(recv_handles, recv_datas):
+                    key_handles = recv_handle[0]
+                    value_handles = recv_handle[1]
+                    key_descr = recv_data[0]
+                    value_descr = recv_data[1]
+                    # acclocate key cache
+                    # note that self._allocated_tensors is a Dict
+                    for handle, descr in zip(key_handles, key_descr):
+                        self._allocated_tensors_key[handle] = descr.make_zeros()
+
+                        num_elements = self._allocated_tensors_key[handle].numel()
+                        bytes_per_element = self._allocated_tensors_key[handle].element_size()
+                        total_memory_bytes = num_elements * bytes_per_element
+                        total += total_memory_bytes
+                        #print('single memory usage: {} MB'.format(total_memory_bytes / (1024 ** 2)))
+
+                        assert handle in self._allocated_tensors_key, f"Sanity check failed: no such handle ({handle})"
+                    # acclocate value cache
+                    for handle, descr in zip(value_handles, value_descr):
+                        self._allocated_tensors_value[handle] = descr.make_zeros()
+
+                        num_elements = self._allocated_tensors_value[handle].numel()
+                        bytes_per_element = self._allocated_tensors_value[handle].element_size()
+                        total_memory_bytes = num_elements * bytes_per_element
+                        total += total_memory_bytes
+
+                        assert handle in self._allocated_tensors_value, f"Sanity check failed: no such handle ({handle})"
+
+                total_memory_MB = total / (1024 ** 2)
+                print(f"memory space used: {total_memory_MB:.2f} MB")
+            else:  # delete tensors by handle
+                for recv_handle in recv_handles:
+                    key_handles = recv_handle[0]
+                    value_handles = recv_handle[1]
+                    for handle in key_handles:
+                        if handle not in self._allocated_tensors_key:
+                            logger.warning(
+                                f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
+                            )
+                        self._allocated_tensors_key.pop(handle, None)
+                    for handle in value_handles:
+                        if handle not in self._allocated_tensors_value:
+                            logger.warning(
+                                f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
+                            )
+                        self._allocated_tensors_value.pop(handle, None)
+            with self._lock_metadata:
+                del self.handles_to_alloc[:]
+                del self.descr_to_alloc[:]
+            '''
+        handles = handles[0]
+        key_handles = tuple(handles[0])
+        value_handles = tuple(handles[1])
+        yield tuple([[self._allocated_tensors_key[handle] for handle in key_handles], [self._allocated_tensors_value[handle] for handle in value_handles]])
 
 
 class AllocationFailed(Exception):

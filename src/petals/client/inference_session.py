@@ -91,12 +91,14 @@ class _ServerInferenceSession:
         *,
         step_id: str,
         start_from_position: int,
+        iteration_info
     ) -> torch.Tensor:
         """
         Inference step: send a chunk of input tensors and receive a chunk of outputs
         :prompts: optional DEEP prompts, added to a prefix of each layer's outputs,
           if specified, deep prompts should have shape [num_layers, batch_size, prefix_len, hid_size]
         """
+
         if self.closed:
             raise Exception("Session is closed, cannot perform step")
 
@@ -136,16 +138,23 @@ class _ServerInferenceSession:
 
         request_metadata["args_structure"] = args_structure
 
+        # we pack request_id into request_metadata here
+
+        request_metadata["iteration_info"] = iteration_info
+
         # TODO: make possible to use different compression method for different tensors
         server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
         compression = server_side_inference_schema[0].compression
         inference_schema = tuple(BatchTensorDescriptor.from_tensor(arg, compression) for arg in input_tensors)
 
+        ts = iteration_info['timestamp']
+        print('pre processing: {}'.format(time.time() - ts))
+
+
         # TODO: create more explicit way to check servers schema and client's structure
         assert len(input_tensors) >= len(
             server_side_inference_schema
         ), "Hidden_state, prompts and hypo_ids tensors are necessary for an inference step"
-
         outputs_serialized = RemoteExpertWorker.run_coroutine(
             self._step(
                 runtime_pb2.ExpertRequest(
@@ -276,6 +285,7 @@ class InferenceSession:
         prompts: Optional[torch.Tensor] = None,
         hypo_ids: Optional[torch.Tensor] = None,
         start_from_position: Optional[int] = None,
+        iteration_info = None
     ) -> torch.Tensor:
 
         if start_from_position is not None:
@@ -330,6 +340,7 @@ class InferenceSession:
                         hypo_ids,
                         step_id=step_id,
                         start_from_position=start_from_position,
+                        iteration_info = iteration_info,
                     )
 
                     server_idx += 1
