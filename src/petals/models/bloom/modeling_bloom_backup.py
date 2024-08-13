@@ -248,7 +248,6 @@ class BloomAttention(nn.Module):
         head_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
-        iteration_info = None,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
         # 3 x [batch_size, seq_length, num_heads, head_dim]
@@ -259,89 +258,52 @@ class BloomAttention(nn.Module):
         query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
         key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
         value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            # concatenate along seq_length dimension:
+            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
+            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
+            key_layer = torch.cat((past_key, key_layer), dim=2)
+            value_layer = torch.cat((past_value, value_layer), dim=1)
 
-        # split each request here, [num_heads, sum(seq_length), head_dim]
-        batch_size = iteration_info['batch_size']
-        input_length_table = iteration_info['input_length_table']
-        token_num_table = iteration_info['iter_token_num_table']
-        stage = iteration_info['stage']
-        token_num_idx = 0
-        input_length_idx = 0
-        key_layer_past = layer_past[0]
-        value_layer_past = layer_past[1]
-        context_layer_list = []
-        new_key_list = []
-        new_value_list = []
-        for i in range(batch_size):
-            req_query_layer = query_layer[:, token_num_idx:token_num_idx+token_num_table[i], :]
-            req_key_layer = key_layer[:, :, token_num_idx:token_num_idx+token_num_table[i]]
-            req_value_layer = value_layer[:, token_num_idx:token_num_idx+token_num_table[i], :]
-            token_num_idx += token_num_table[i]
-            req_layer_past = tuple([key_layer_past[i], value_layer_past[i]])
+        _, _, kv_length = key_layer.shape
 
-            if stage == 'prefill':
-                req_attention_mask = attention_mask[:, :, input_length_idx:input_length_idx+input_length_table[i], input_length_idx:input_length_idx+input_length_table[i]]
-            else:
-                req_attention_mask = attention_mask[:, :, :, input_length_idx:input_length_idx+input_length_table[i]]
+        if use_cache is True:
+            present = (key_layer, value_layer)
+        else:
+            present = None
 
-            req_alibi = alibi[:, :, input_length_idx:input_length_idx+input_length_table[i]]
-            input_length_idx += input_length_table[i]
+        # [batch_size * num_heads, q_length, kv_length]
+        # we use `torch.Tensor.baddbmm` instead of `torch.baddbmm` as the latter isn't supported by TorchScript v1.11
+        matmul_result = alibi.baddbmm(
+            batch1=query_layer,
+            batch2=key_layer,
+            beta=self.beta,
+            alpha=self.inv_norm_factor,
+        )
 
-            if req_layer_past is not None:
-                past_key, past_value = req_layer_past
-                # concatenate along seq_length dimension:
-                #  - key: [batch_size * self.num_heads, head_dim, kv_length]
-                #  - value: [batch_size * self.num_heads, kv_length, head_dim]
-                req_key_layer = torch.cat((past_key, req_key_layer), dim=2)
-                req_value_layer = torch.cat((past_value, req_value_layer), dim=1)
+        # change view to [batch_size, num_heads, q_length, kv_length]
+        attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
 
-            _, _, kv_length = req_key_layer.shape
+        # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
+        input_dtype = attention_scores.dtype
+        # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
+        if input_dtype == torch.float16:
+            attention_scores = attention_scores.to(torch.float)
+        attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
+        attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
 
-            if use_cache is True:
-                #present = (key_layer, value_layer)
-                new_key_list.append(req_key_layer)
-                new_value_list.append(req_value_layer)
-            else:
-                #present = None
-                pass
+        # [batch_size, num_heads, q_length, kv_length]
+        attention_probs = self.attention_dropout(attention_probs)
 
-            # [batch_size * num_heads, q_length, kv_length]
-            # we use `torch.Tensor.baddbmm` instead of `torch.baddbmm` as the latter isn't supported by TorchScript v1.11
-            matmul_result = req_alibi.baddbmm(
-                batch1=req_query_layer,
-                batch2=req_key_layer,
-                beta=self.beta,
-                alpha=self.inv_norm_factor,
-            )
-            
-            q_length = token_num_table[i]
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
 
-            # change view to [batch_size, num_heads, q_length, kv_length]
-            attention_scores = matmul_result.view(1, self.num_heads, q_length, kv_length)
+        # change view [batch_size x num_heads, q_length, kv_length]
+        attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
 
-            # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
-            input_dtype = attention_scores.dtype
-            # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
-            if input_dtype == torch.float16:
-                attention_scores = attention_scores.to(torch.float)
-            attn_weights = torch.masked_fill(attention_scores, req_attention_mask, torch.finfo(attention_scores.dtype).min)
-
-            attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
-
-            # [batch_size, num_heads, q_length, kv_length]
-            attention_probs = self.attention_dropout(attention_probs)
-
-            if head_mask is not None:
-                attention_probs = attention_probs * head_mask
-
-            # change view [batch_size x num_heads, q_length, kv_length]
-            attention_probs_reshaped = attention_probs.view(1 * self.num_heads, q_length, kv_length)
-
-            # matmul: [batch_size * num_heads, q_length, head_dim]
-            req_context_layer = torch.bmm(attention_probs_reshaped, req_value_layer)
-            context_layer_list.append(req_context_layer)
-        
-        context_layer = torch.concat(context_layer_list, dim = 1)
+        # matmul: [batch_size * num_heads, q_length, head_dim]
+        context_layer = torch.bmm(attention_probs_reshaped, value_layer)
 
         # change view [batch_size, q_length, num_heads * head_dim]
         context_layer = self._merge_heads(context_layer)
@@ -359,8 +321,6 @@ class BloomAttention(nn.Module):
             output_tensor = self.dense(context_layer)
 
         output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
-
-        present = (new_key_list, new_value_list)
 
         outputs = (output_tensor, present)
         if output_attentions:
@@ -427,6 +387,7 @@ class BloomBlock(nn.Module):
         iteration_info = None,
     ):
         # hidden_states: [batch_size, seq_length, hidden_size]
+
         ts = time.time()
 
         # Layer norm at the beginning of the transformer layer.
@@ -439,27 +400,66 @@ class BloomBlock(nn.Module):
         else:
             residual = hidden_states
 
-        tsa = time.time()
+        te = time.time()
+        ft = te - ts
 
-        attn_outputs = self.self_attention(
-                layernorm_output,
-                residual,
-                layer_past=layer_past,
-                attention_mask=attention_mask,
-                alibi=alibi,
-                head_mask=head_mask,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                iteration_info=iteration_info
-            )
+        # Self attention.
+        # we should serially compute self-attention for prompts in the batch
+        # layer_past **THAT WE RECEIVE HERE** should be a tuple of two list, 
+        # containing key/value cache for requests in the batch respectively
+        # while the layer_past that self_attention() receives is a tuple of two tensors
+        # each representing key or value cache tensor of a single request
 
-        tea = time.time()
-        print('*' * 50)
-        print('attention time: {}'.format(tea - tsa))
+        batch_size = iteration_info['batch_size']
+        input_length_table = iteration_info['input_length_table']
+        token_num_table = iteration_info['iter_token_num_table']
+        stage = iteration_info['stage']
+        input_length_idx = 0
+        token_num_idx = 0
 
-        attention_output = attn_outputs[0]
 
-        outputs = attn_outputs[1]
+        key_layer_past = layer_past[0]
+        value_layer_past = layer_past[1]
+        output_tensors_list = []
+        new_key_list = []
+        new_value_list = []
+
+        ts = time.time()
+
+        for i in range(batch_size):
+            tr0 = time.time()
+            req_layernorm_output = layernorm_output[:, token_num_idx:token_num_idx+token_num_table[i], :]
+            req_residual = residual[:, token_num_idx:token_num_idx+token_num_table[i], :]
+            token_num_idx += token_num_table[i]
+            req_layer_past = tuple([key_layer_past[i], value_layer_past[i]])
+            if stage == 'prefill':
+                req_attention_mask = attention_mask[:, :, input_length_idx:input_length_idx+input_length_table[i], input_length_idx:input_length_idx+input_length_table[i]]
+            else:
+                req_attention_mask = attention_mask[:, :, :, input_length_idx:input_length_idx+input_length_table[i]]
+            
+            req_alibi = alibi[:, :, input_length_idx:input_length_idx+input_length_table[i]]
+            input_length_idx += input_length_table[i]
+            # this would normally return 2 objects, the first is the ouuput tensors
+            # the second is the new key/value tensors
+            tr1 = time.time()
+            req_attn_outputs = self.self_attention(
+                    req_layernorm_output,
+                    req_residual,
+                    layer_past=req_layer_past,
+                    attention_mask=req_attention_mask,
+                    alibi=req_alibi,
+                    head_mask=head_mask,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                )
+            output_tensors_list.append(req_attn_outputs[0])
+            new_key_list.append(req_attn_outputs[1][0])
+            new_value_list.append(req_attn_outputs[1][1])
+
+
+        attention_output = torch.concat(output_tensors_list, dim=1)
+
+        outputs = (new_key_list, new_value_list)
 
         layernorm_output = self.post_attention_layernorm(attention_output)
 
@@ -471,11 +471,6 @@ class BloomBlock(nn.Module):
 
         # MLP.
         output = self.mlp(layernorm_output, residual)
-
-        te = time.time()
-        print('other time: {}'.format((te - ts) - (tea - tsa)))
-        print('all time: {}'.format(te - ts))
-        print('*' * 50)
 
         if use_cache:
             outputs = (output, outputs)

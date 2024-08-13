@@ -6,6 +6,7 @@ class Http_client:
         pass
 
     async def send_message(self, session, url, message):
+        headers = {'Content-Type': 'application/json'}
         async with session.post(url, data=message) as response:
             return await response.text()
 

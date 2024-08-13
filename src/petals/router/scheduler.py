@@ -32,7 +32,7 @@ class Scheduler:
 
     def __init__(self, model, tokenizer, session) -> None:
         self.requests_pool = asyncio.PriorityQueue()
-        self.max_batch_size = 10
+        self.max_batch_size = 50
         self.data_queue = asyncio.Queue()
         self.response_queues = {}
         self.inputs_queue = asyncio.Queue()
@@ -136,7 +136,9 @@ class Scheduler:
                     'stage': 'prefill'
                 }
                 # send to LLM
+                print('8' * 100)
                 result_this_iter, info = self.model.generate(batched_input, iteration_info = iteration_info, max_new_tokens=20)
+                print('9' * 100)
                 returned_length_table = info[0]
                 finished_table = info[1]
                 assert len(returned_length_table) == batch_size

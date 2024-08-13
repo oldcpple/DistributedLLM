@@ -167,16 +167,6 @@ class TransformerBackend(ModuleBackend):
         assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]"
         seq_len = hidden_states.shape[1]
 
-        for id in iteration_info['request_id_table']:
-            print('in table: {}'.format(id in self.attention_alloc_table))
-            if id in self.attention_alloc_table:
-                print(self.attention_alloc_table[id].key_handle, self.attention_alloc_table[id].value_handle)
-                kh = self.attention_alloc_table[id].key_handle
-                e = kh in self.memory_cache._allocated_tensors_key
-                print('in cache: {}'.format(e))
-                if e:
-                    print('all 0: {}'.format(torch.all(self.memory_cache._allocated_tensors_key[kh].eq(0))))
-
         input_length_table = iteration_info['input_length_table']
 
         finished_request_id_table = iteration_info['finished_request_id_table']

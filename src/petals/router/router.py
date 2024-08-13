@@ -19,7 +19,7 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 class Http_server:
 
     def __init__(self, model_name):
-        self.initial_peers = ['/ip4/127.0.0.1/tcp/36179/p2p/12D3KooWHeM4WehK6fgMsDwywCderkQKAZXkTraiaqRb2bbYwAnu']
+        self.initial_peers = ['/ip4/192.168.130.241/tcp/46617/p2p/12D3KooWA94ramnXLtGMHovogPWUQGLPZ3k6Ds5iDfwFTRUWZwa5']
         self.scheduler = None
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, add_bos_token=False)
@@ -51,6 +51,7 @@ class Http_server:
 
         result = await self.scheduler.response_queues[queue_id].get()
         result_text, result_length = result
+        print(result_text)
         return web.json_response({'result': result_text, 'length': result_length})
 
     async def init_app(self):
