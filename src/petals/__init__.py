@@ -15,6 +15,7 @@ from packaging import version
 from petals.client import *
 from petals.models import *
 from petals.utils import *
+from petals.router import *
 from petals.utils.logging import initialize_logs as _initialize_logs
 
 __version__ = "2.3.0.dev2"

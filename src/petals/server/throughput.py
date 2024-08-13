@@ -119,6 +119,12 @@ def measure_throughput_info(
     logger.info(
         "Measuring network and compute throughput. This takes about a minute and will be cached for future runs"
     )
+    print('At current version we ignore the throughput measuring')
+    return {
+        "inference_rps": 1.0,
+        "forward_rps": 1.0,
+        "network_rps": 1.0,
+    }
     return {
         "inference_rps": measure_compute_rps(
             config,

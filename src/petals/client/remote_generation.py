@@ -13,7 +13,7 @@ from transformers.generation.utils import ModelOutput
 from petals.client.inference_session import InferenceSession
 from petals.client.remote_sequential import RemoteSequential
 from petals.utils.misc import DUMMY, docstring_from
-from petals.utils.generation_utils import GenerationMixin
+#from petals.utils.generation_utils import GenerationMixin
 
 logger = get_logger(__name__)
 
@@ -175,8 +175,8 @@ class RemoteGenerationMixin(_SkipTokensMixin):
                 past_key_values.update_seen(session.position)
                 kwargs["past_key_values"] = past_key_values
             
-
-            results = GenerationMixin().generate(inputs, *args, **kwargs)
+            #results = GenerationMixin().generate(inputs, *args, **kwargs)
+            results = super().generate(inputs, *args, **kwargs)
             
             result = results[0]
             info = results[1]
